@@ -29,6 +29,13 @@ def cleanup_file(filepath: str):
     except Exception:
         pass
 
+def clean_media_url(url: str) -> str:
+    # Clean YouTube Mix / Playlist / Radio tracking parameters to avoid 403 Forbidden playlist blocks
+    yt_m = re.search(r'(?:youtu\.be\/|youtube\.com\/(?:watch\?v=|shorts\/|embed\/))([a-zA-Z0-9_-]{11})', url)
+    if yt_m:
+        return f"https://www.youtube.com/watch?v={yt_m.group(1)}"
+    return url
+
 class ExtractRequest(BaseModel):
     url: str
     downloadMode: str = "auto"
@@ -46,16 +53,17 @@ def health_check():
     return {
         "status": "ok",
         "app": "SnapSave Downloader Engine",
-        "version": "1.2.0",
+        "version": "1.3.0",
         "yt_dlp_version": yt_dlp.version.__version__
     }
 
 @app.post("/api/extract")
 def extract_media(req: ExtractRequest, request: Request):
-    url = req.url.strip()
-    if not url:
+    raw_url = req.url.strip()
+    if not raw_url:
         raise HTTPException(status_code=400, detail="URL is required")
 
+    url = clean_media_url(raw_url)
     base_url = str(request.base_url).rstrip('/')
 
     # 1. Fast-path for TikTok
@@ -84,7 +92,7 @@ def extract_media(req: ExtractRequest, request: Request):
         except Exception:
             pass
 
-    # 2. Extract with yt-dlp (android client alone bypasses YouTube player response blocks)
+    # 2. Extract with yt-dlp (android client + noplaylist)
     is_youtube = ("youtube.com" in url.lower()) or ("youtu.be" in url.lower())
     info = None
 
@@ -95,6 +103,7 @@ def extract_media(req: ExtractRequest, request: Request):
                 ydl_opts = {
                     'quiet': True,
                     'no_warnings': True,
+                    'noplaylist': True,
                     'extract_flat': False,
                     'format': '18/best',
                     'extractor_args': {'youtube': {'player_client': client}}
@@ -140,7 +149,7 @@ def extract_media(req: ExtractRequest, request: Request):
     if not info:
         # Try generic extractor for Instagram, Facebook, Twitter, etc.
         try:
-            ydl_opts = {'quiet': True, 'no_warnings': True, 'extract_flat': False}
+            ydl_opts = {'quiet': True, 'no_warnings': True, 'noplaylist': True, 'extract_flat': False}
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(url, download=False)
         except Exception as e:
@@ -184,7 +193,8 @@ def download_media(
     quality: str = Query("1080", description="Video quality"),
     filename: str = Query(None, description="Download filename")
 ):
-    clean_url = urllib.parse.unquote(url)
+    raw_url = urllib.parse.unquote(url)
+    clean_url = clean_media_url(raw_url)
     is_audio = (mode == "audio")
     file_id = str(uuid.uuid4())[:8]
     ext = "mp3" if is_audio else "mp4"
@@ -196,6 +206,7 @@ def download_media(
         ydl_opts = {
             'quiet': True,
             'no_warnings': True,
+            'noplaylist': True,
             'format': 'bestaudio/best',
             'postprocessors': [{
                 'key': 'FFmpegExtractAudio',
@@ -210,6 +221,7 @@ def download_media(
         ydl_opts = {
             'quiet': True,
             'no_warnings': True,
+            'noplaylist': True,
             'format': '18/best[ext=mp4]/best',
             'outtmpl': out_template,
         }
