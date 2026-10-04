@@ -312,9 +312,6 @@ def run_download_task(task_id: str, clean_url: str, mode: str, quality: str, req
         if FFMPEG_PATH:
             ydl_opts['ffmpeg_location'] = FFMPEG_PATH
 
-        if is_youtube:
-            ydl_opts['extractor_args'] = {'youtube': {'player_client': ['tv_embedded', 'android']}}
-
         if is_audio:
             ydl_opts['format'] = '140/bestaudio/best'
             if FFMPEG_PATH:
@@ -483,9 +480,6 @@ def download_media(
 
             if FFMPEG_PATH:
                 ydl_opts['ffmpeg_location'] = FFMPEG_PATH
-
-            if is_youtube:
-                ydl_opts['extractor_args'] = {'youtube': {'player_client': ['tv_embedded', 'android']}}
 
             if is_audio:
                 ydl_opts['format'] = '140/bestaudio/best'
