@@ -30,6 +30,42 @@ app.add_middleware(
 TEMP_DIR = "/tmp/downloads" if os.path.exists("/tmp") else os.path.join(os.path.dirname(__file__), "downloads")
 os.makedirs(TEMP_DIR, exist_ok=True)
 
+COOKIE_FILE = os.path.join(os.path.dirname(__file__), "cookies.txt")
+env_cookies = os.environ.get("YOUTUBE_COOKIES")
+if env_cookies and (not os.path.exists(COOKIE_FILE) or os.path.getsize(COOKIE_FILE) == 0):
+    try:
+        with open(COOKIE_FILE, "w", encoding="utf-8") as f:
+            f.write(env_cookies.strip())
+    except Exception:
+        pass
+
+def get_base_ydl_opts(custom_opts=None):
+    import shutil
+    opts = {
+        'quiet': True,
+        'no_warnings': True,
+        'noplaylist': True,
+        'socket_timeout': 30,
+    }
+    js_runtimes = {}
+    if shutil.which("node"):
+        js_runtimes['node'] = {}
+    if shutil.which("deno"):
+        js_runtimes['deno'] = {}
+    if js_runtimes:
+        opts['js_runtimes'] = js_runtimes
+
+    if os.path.exists(COOKIE_FILE) and os.path.getsize(COOKIE_FILE) > 10:
+        opts['cookiefile'] = COOKIE_FILE
+
+    proxy = os.environ.get("HTTP_PROXY") or os.environ.get("HTTPS_PROXY") or os.environ.get("YOUTUBE_PROXY")
+    if proxy:
+        opts['proxy'] = proxy
+
+    if custom_opts:
+        opts.update(custom_opts)
+    return opts
+
 # In-memory dictionary for real-time download tasks
 download_tasks = {}
 
@@ -110,12 +146,18 @@ def sanitize_filename(name: str, ext: str = "mp4") -> str:
 
 @app.get("/")
 def health_check():
+    import shutil
+    has_cookies = os.path.exists(COOKIE_FILE) and os.path.getsize(COOKIE_FILE) > 10
+    has_node = bool(shutil.which("node"))
+    has_deno = bool(shutil.which("deno"))
     return {
         "status": "ok",
         "app": "SnapSave Downloader Engine",
-        "version": "1.5.0",
+        "version": "1.6.0",
         "yt_dlp_version": yt_dlp.version.__version__,
-        "ffmpeg": bool(FFMPEG_PATH)
+        "ffmpeg": bool(FFMPEG_PATH),
+        "cookies_loaded": has_cookies,
+        "js_runtime": "node" if has_node else ("deno" if has_deno else "none")
     }
 
 @app.get("/api/test-clients")
@@ -211,13 +253,10 @@ def extract_media(req: ExtractRequest, request: Request):
 
     # 3. For Instagram, Facebook, Twitter, etc., extract with yt-dlp
     try:
-        ydl_opts = {
-            'quiet': True,
-            'no_warnings': True,
-            'noplaylist': True,
+        ydl_opts = get_base_ydl_opts({
             'extract_flat': False,
-            'socket_timeout': 10,
-        }
+            'socket_timeout': 15,
+        })
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             info = ydl.extract_info(url, download=False)
     except Exception as e:
@@ -296,21 +335,23 @@ def run_download_task(task_id: str, clean_url: str, mode: str, quality: str, req
             })
 
     try:
-        ydl_opts = {
-            'quiet': True,
-            'no_warnings': True,
-            'noplaylist': True,
+        ydl_opts = get_base_ydl_opts({
             'outtmpl': out_template,
-            'socket_timeout': 30,
             'progress_hooks': [hook],
             'concurrent_fragment_downloads': 16,
             'http_chunk_size': 10485760,
             'buffersize': 1048576,
-            'js_runtimes': {'node': {}},
-        }
+        })
 
         if FFMPEG_PATH:
             ydl_opts['ffmpeg_location'] = FFMPEG_PATH
+
+        if is_youtube:
+            ydl_opts['extractor_args'] = {
+                'youtube': {
+                    'player_client': ['tv_embedded', 'tv', 'ios', 'android', 'web']
+                }
+            }
 
         if is_audio:
             ydl_opts['format'] = '140/bestaudio/best'
@@ -398,11 +439,12 @@ def start_download(req: StartDownloadRequest):
     return {"taskId": task_id, "status": "queued"}
 
 @app.get("/api/progress")
-def get_progress(id: str = Query(..., description="Task ID")):
-    if id not in download_tasks:
+def get_progress(id: str = Query(None, description="Task ID"), taskId: str = Query(None, description="Task ID")):
+    task_id = id or taskId
+    if not task_id or task_id not in download_tasks:
         raise HTTPException(status_code=404, detail="Task not found")
 
-    task = download_tasks[id]
+    task = download_tasks[task_id]
     return {
         "status": task.get("status"),
         "percent": task.get("percent", 0.0),
@@ -417,12 +459,14 @@ def get_progress(id: str = Query(..., description="Task ID")):
 @app.get("/api/file")
 def get_downloaded_file(
     background_tasks: BackgroundTasks,
-    id: str = Query(..., description="Task ID")
+    id: str = Query(None, description="Task ID"),
+    taskId: str = Query(None, description="Task ID")
 ):
-    if id not in download_tasks:
+    task_id = id or taskId
+    if not task_id or task_id not in download_tasks:
         raise HTTPException(status_code=404, detail="Task not found")
 
-    task = download_tasks[id]
+    task = download_tasks[task_id]
     if task.get("status") != "ready":
         raise HTTPException(status_code=400, detail="File is not ready yet")
 
@@ -466,20 +510,22 @@ def download_media(
 
     for client_list in client_configs:
         try:
-            ydl_opts = {
-                'quiet': True,
-                'no_warnings': True,
-                'noplaylist': True,
+            ydl_opts = get_base_ydl_opts({
                 'outtmpl': out_template,
-                'socket_timeout': 30,
                 'concurrent_fragment_downloads': 16,
                 'http_chunk_size': 10485760,
                 'buffersize': 1048576,
-                'js_runtimes': {'node': {}},
-            }
+            })
 
             if FFMPEG_PATH:
                 ydl_opts['ffmpeg_location'] = FFMPEG_PATH
+
+            if is_youtube:
+                ydl_opts['extractor_args'] = {
+                    'youtube': {
+                        'player_client': ['tv_embedded', 'tv', 'ios', 'android', 'web']
+                    }
+                }
 
             if is_audio:
                 ydl_opts['format'] = '140/bestaudio/best'
