@@ -54,6 +54,7 @@ def get_base_ydl_opts(custom_opts=None):
         js_runtimes['deno'] = {}
     if js_runtimes:
         opts['js_runtimes'] = js_runtimes
+        opts['remote_components'] = ['ejs:github']
 
     if os.path.exists(COOKIE_FILE) and os.path.getsize(COOKIE_FILE) > 10:
         opts['cookiefile'] = COOKIE_FILE
@@ -346,12 +347,6 @@ def run_download_task(task_id: str, clean_url: str, mode: str, quality: str, req
         if FFMPEG_PATH:
             ydl_opts['ffmpeg_location'] = FFMPEG_PATH
 
-        if is_youtube:
-            ydl_opts['extractor_args'] = {
-                'youtube': {
-                    'player_client': ['tv_embedded', 'tv', 'ios', 'android', 'web']
-                }
-            }
 
         if is_audio:
             ydl_opts['format'] = '140/bestaudio/best'
@@ -520,12 +515,6 @@ def download_media(
             if FFMPEG_PATH:
                 ydl_opts['ffmpeg_location'] = FFMPEG_PATH
 
-            if is_youtube:
-                ydl_opts['extractor_args'] = {
-                    'youtube': {
-                        'player_client': ['tv_embedded', 'tv', 'ios', 'android', 'web']
-                    }
-                }
 
             if is_audio:
                 ydl_opts['format'] = '140/bestaudio/best'
