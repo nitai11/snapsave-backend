@@ -118,6 +118,23 @@ def health_check():
         "ffmpeg": bool(FFMPEG_PATH)
     }
 
+@app.get("/api/test-clients")
+def test_clients(url: str = "https://www.youtube.com/watch?v=GjfxDRRLXAQ"):
+    results = {}
+    clients = [None, ['android'], ['tv'], ['tv_embedded'], ['ios'], ['mweb'], ['web']]
+    for c in clients:
+        c_name = str(c)
+        try:
+            ydl_opts = {'quiet': True, 'no_warnings': True}
+            if c:
+                ydl_opts['extractor_args'] = {'youtube': {'player_client': c}}
+            with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                info = ydl.extract_info(url, download=False)
+                results[c_name] = f"SUCCESS: {info.get('title')[:30]} ({len(info.get('formats', []))} formats)"
+        except Exception as e:
+            results[c_name] = f"FAILED: {str(e)[:100]}"
+    return results
+
 @app.post("/api/extract")
 def extract_media(req: ExtractRequest, request: Request):
     raw_url = req.url.strip()
@@ -295,6 +312,9 @@ def run_download_task(task_id: str, clean_url: str, mode: str, quality: str, req
         if FFMPEG_PATH:
             ydl_opts['ffmpeg_location'] = FFMPEG_PATH
 
+        if is_youtube:
+            ydl_opts['extractor_args'] = {'youtube': {'player_client': ['tv_embedded', 'android']}}
+
         if is_audio:
             ydl_opts['format'] = '140/bestaudio/best'
             if FFMPEG_PATH:
@@ -342,10 +362,15 @@ def run_download_task(task_id: str, clean_url: str, mode: str, quality: str, req
             'message': 'Ready for download'
         })
     except Exception as e:
+        err_msg = str(e)
+        if "Failed to extract any player response" in err_msg or "unavailable" in err_msg.lower():
+            friendly_err = "यह वीडियो YouTube पर मौजूद नहीं है, हटा दी गई है या प्राइवेट है। कृपया किसी चालू वीडियो का लिंक डालें。"
+        else:
+            friendly_err = f"Download error: {err_msg[:120]}"
         download_tasks[task_id].update({
             'status': 'error',
-            'error': str(e),
-            'message': f"Error: {str(e)[:100]}"
+            'error': friendly_err,
+            'message': friendly_err
         })
 
 @app.post("/api/start-download")
@@ -459,8 +484,8 @@ def download_media(
             if FFMPEG_PATH:
                 ydl_opts['ffmpeg_location'] = FFMPEG_PATH
 
-            if client_list:
-                ydl_opts['extractor_args'] = {'youtube': {'player_client': client_list}}
+            if is_youtube:
+                ydl_opts['extractor_args'] = {'youtube': {'player_client': ['tv_embedded', 'android']}}
 
             if is_audio:
                 ydl_opts['format'] = '140/bestaudio/best'
@@ -497,9 +522,14 @@ def download_media(
             continue
 
     if not downloaded_file or not os.path.exists(downloaded_file) or os.path.getsize(downloaded_file) == 0:
+        err_msg = str(last_error) if last_error else 'No file produced'
+        if "Failed to extract any player response" in err_msg or "unavailable" in err_msg.lower():
+            friendly_err = "यह वीडियो YouTube पर मौजूद नहीं है, हटा दी गई है या प्राइवेट है। कृपया चालू वीडियो का लिंक चेक करें।"
+        else:
+            friendly_err = f"Download engine error: {err_msg[:120]}"
         raise HTTPException(
-            status_code=500,
-            detail=f"Download engine error: {str(last_error) if last_error else 'No file produced'}"
+            status_code=400,
+            detail=friendly_err
         )
 
     # Determine real extension
