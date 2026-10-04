@@ -1,17 +1,16 @@
 import os
 import re
+import uuid
 import urllib.parse
-import subprocess
 import requests
-from fastapi import FastAPI, HTTPException, Query, Request
+from fastapi import FastAPI, HTTPException, Query, Request, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 import yt_dlp
 
 app = FastAPI(title="SnapSave Downloader API")
 
-# Enable CORS for all domains
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -19,6 +18,16 @@ app.add_middleware(
     allow_methods=["*"],
     allow_headers=["*"],
 )
+
+TEMP_DIR = "/tmp/downloads"
+os.makedirs(TEMP_DIR, exist_ok=True)
+
+def cleanup_file(filepath: str):
+    try:
+        if os.path.exists(filepath):
+            os.remove(filepath)
+    except Exception:
+        pass
 
 class ExtractRequest(BaseModel):
     url: str
@@ -37,7 +46,7 @@ def health_check():
     return {
         "status": "ok",
         "app": "SnapSave Downloader Engine",
-        "version": "1.0.0",
+        "version": "1.1.0",
         "yt_dlp_version": yt_dlp.version.__version__
     }
 
@@ -49,7 +58,7 @@ def extract_media(req: ExtractRequest, request: Request):
 
     base_url = str(request.base_url).rstrip('/')
 
-    # 1. Fast-path for TikTok to avoid IP rate-limits
+    # 1. Fast-path for TikTok
     if "tiktok.com" in url.lower():
         try:
             tik_res = requests.get(f"https://www.tikwm.com/api/?url={urllib.parse.quote(url)}", timeout=10)
@@ -75,117 +84,88 @@ def extract_media(req: ExtractRequest, request: Request):
         except Exception:
             pass
 
-    # 2. Multi-client YouTube pool (tries android first, then ios, then mweb, then tv_embedded)
+    # 2. Extract with yt-dlp (android client for YouTube bypass)
     is_youtube = ("youtube.com" in url.lower()) or ("youtu.be" in url.lower())
     info = None
-    last_err = None
 
     if is_youtube:
-        clients_to_try = [
-            ['android'],
-            ['ios'],
-            ['mweb'],
-            ['android_creator'],
-            ['tv_embedded']
-        ]
-
+        clients_to_try = [['android'], ['ios'], ['mweb'], ['tv_embedded']]
         for client in clients_to_try:
             try:
                 ydl_opts = {
                     'quiet': True,
                     'no_warnings': True,
                     'extract_flat': False,
-                    'extractor_args': {
-                        'youtube': {
-                            'player_client': client,
-                        }
-                    }
+                    'extractor_args': {'youtube': {'player_client': client}}
                 }
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                     extracted = ydl.extract_info(url, download=False)
                     if extracted and extracted.get('title'):
                         info = extracted
                         break
-            except Exception as e:
-                last_err = e
+            except Exception:
                 continue
-    else:
-        # All other platforms: Instagram, Facebook, Twitter/X, Reddit, Vimeo, SoundCloud
+
+    if not info and is_youtube:
+        # Fallback to official YouTube oEmbed for guaranteed metadata
+        m = re.search(r'(?:youtu\.be\/|youtube\.com\/(?:watch\?v=|shorts\/|embed\/))([a-zA-Z0-9_-]{11})', url)
+        yt_id = m.group(1) if m else None
+        if yt_id:
+            try:
+                oembed = requests.get(f"https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v={yt_id}&format=json", timeout=6).json()
+                title = oembed.get('title', 'YouTube Video')
+                clean_mp4 = sanitize_filename(title, "mp4")
+                clean_mp3 = sanitize_filename(title, "mp3")
+                encoded_url = urllib.parse.quote(url)
+
+                dl_video = f"{base_url}/api/download?url={encoded_url}&mode=auto&quality={req.videoQuality}&filename={urllib.parse.quote(clean_mp4)}"
+                dl_audio = f"{base_url}/api/download?url={encoded_url}&mode=audio&filename={urllib.parse.quote(clean_mp3)}"
+
+                return {
+                    "status": "tunnel",
+                    "url": dl_audio if req.downloadMode == "audio" else dl_video,
+                    "videoUrl": dl_video,
+                    "audioUrl": dl_audio,
+                    "title": title,
+                    "author": oembed.get('author_name', 'YouTube'),
+                    "thumbnail": oembed.get('thumbnail_url', f"https://i.ytimg.com/vi/{yt_id}/hqdefault.jpg"),
+                    "duration": "",
+                    "filename": clean_mp3 if req.downloadMode == "audio" else clean_mp4,
+                    "ytVideoId": yt_id,
+                }
+            except Exception:
+                pass
+
+    if not info:
+        # Try generic extractor for Instagram, Facebook, Twitter, etc.
         try:
-            ydl_opts = {
-                'quiet': True,
-                'no_warnings': True,
-                'extract_flat': False,
-            }
+            ydl_opts = {'quiet': True, 'no_warnings': True, 'extract_flat': False}
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(url, download=False)
         except Exception as e:
-            last_err = e
+            raise HTTPException(status_code=500, detail=str(e))
 
     if not info:
-        # If all yt-dlp clients fail for YouTube, fallback to official oEmbed so preview & info always load!
-        if is_youtube:
-            m = re.search(r'(?:youtu\.be\/|youtube\.com\/(?:watch\?v=|shorts\/|embed\/))([a-zA-Z0-9_-]{11})', url)
-            yt_id = m.group(1) if m else None
-            if yt_id:
-                try:
-                    oembed = requests.get(f"https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v={yt_id}&format=json", timeout=6).json()
-                    title = oembed.get('title', 'YouTube Video')
-                    author = oembed.get('author_name', 'YouTube')
-                    thumb = oembed.get('thumbnail_url', f"https://i.ytimg.com/vi/{yt_id}/hqdefault.jpg")
-                    clean_mp4 = sanitize_filename(title, "mp4")
-                    clean_mp3 = sanitize_filename(title, "mp3")
-                    encoded_url = urllib.parse.quote(url)
-
-                    dl_video_url = f"{base_url}/api/download?url={encoded_url}&mode=auto&quality={req.videoQuality}&filename={urllib.parse.quote(clean_mp4)}"
-                    dl_audio_url = f"{base_url}/api/download?url={encoded_url}&mode=audio&filename={urllib.parse.quote(clean_mp3)}"
-
-                    return {
-                        "status": "tunnel",
-                        "url": dl_audio_url if req.downloadMode == "audio" else dl_video_url,
-                        "videoUrl": dl_video_url,
-                        "audioUrl": dl_audio_url,
-                        "title": title,
-                        "author": author,
-                        "thumbnail": thumb,
-                        "duration": "",
-                        "filename": clean_mp3 if req.downloadMode == "audio" else clean_mp4,
-                        "ytVideoId": yt_id,
-                    }
-                except Exception:
-                    pass
-
-        raise HTTPException(status_code=500, detail=str(last_err or "Media extraction failed"))
+        raise HTTPException(status_code=404, detail="Could not extract media info")
 
     title = info.get('title', 'Media')
     thumb = info.get('thumbnail', '')
     duration_sec = info.get('duration', 0)
     duration_str = f"{duration_sec // 60}:{duration_sec % 60:02d}" if duration_sec else ""
     author = info.get('uploader', info.get('channel', ''))
-    
-    # YouTube ID if present
-    yt_id = info.get('id') if 'youtube' in (info.get('extractor', '')).lower() else None
+    yt_id = info.get('id') if is_youtube else None
 
-    # Generate direct download endpoints on this API server
-    encoded_url = urllib.parse.quote(url)
     clean_mp4 = sanitize_filename(title, "mp4")
     clean_mp3 = sanitize_filename(title, "mp3")
+    encoded_url = urllib.parse.quote(url)
 
     dl_video_url = f"{base_url}/api/download?url={encoded_url}&mode=auto&quality={req.videoQuality}&filename={urllib.parse.quote(clean_mp4)}"
     dl_audio_url = f"{base_url}/api/download?url={encoded_url}&mode=audio&filename={urllib.parse.quote(clean_mp3)}"
 
-    # Progressive preview URL if available
-    preview_url = ""
-    formats = info.get('formats', [])
-    for f in reversed(formats):
-        if f.get('vcodec') != 'none' and f.get('acodec') != 'none' and f.get('url'):
-            preview_url = f['url']
-            break
-
     return {
         "status": "tunnel",
         "url": dl_audio_url if req.downloadMode == "audio" else dl_video_url,
-        "videoUrl": preview_url or dl_video_url,
+        "videoUrl": dl_video_url,
         "audioUrl": dl_audio_url,
         "title": title,
         "author": author,
@@ -196,7 +176,8 @@ def extract_media(req: ExtractRequest, request: Request):
     }
 
 @app.get("/api/download")
-def download_stream(
+def download_media(
+    background_tasks: BackgroundTasks,
     url: str = Query(..., description="Target media URL"),
     mode: str = Query("auto", description="auto or audio"),
     quality: str = Query("1080", description="Video quality"),
@@ -204,46 +185,62 @@ def download_stream(
 ):
     clean_url = urllib.parse.unquote(url)
     is_audio = (mode == "audio")
-    dl_filename = filename or ("audio.mp3" if is_audio else "video.mp4")
+    file_id = str(uuid.uuid4())[:8]
+    ext = "mp3" if is_audio else "mp4"
+    out_template = os.path.join(TEMP_DIR, f"{file_id}.%(ext)s")
 
-    # Command line args for yt-dlp to stream directly to stdout using android/ios clients
+    is_youtube = ("youtube.com" in clean_url.lower()) or ("youtu.be" in clean_url.lower())
+
     if is_audio:
-        cmd = [
-            "yt-dlp",
-            "-q", "--no-warnings",
-            "--extractor-args", "youtube:player_client=android,ios,mweb",
-            "-x", "--audio-format", "mp3",
-            "-o", "-",
-            clean_url
-        ]
-        media_type = "audio/mpeg"
+        ydl_opts = {
+            'quiet': True,
+            'no_warnings': True,
+            'format': 'bestaudio/best',
+            'postprocessors': [{
+                'key': 'FFmpegExtractAudio',
+                'preferredcodec': 'mp3',
+                'preferredquality': '192',
+            }],
+            'outtmpl': out_template,
+        }
+        if is_youtube:
+            ydl_opts['extractor_args'] = {'youtube': {'player_client': ['android', 'ios']}}
     else:
-        cmd = [
-            "yt-dlp",
-            "-q", "--no-warnings",
-            "--extractor-args", "youtube:player_client=android,ios,mweb",
-            "-f", "best[ext=mp4]/bestvideo+bestaudio/best",
-            "--merge-output-format", "mp4",
-            "-o", "-",
-            clean_url
-        ]
-        media_type = "video/mp4"
+        ydl_opts = {
+            'quiet': True,
+            'no_warnings': True,
+            'format': '18/bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
+            'outtmpl': out_template,
+        }
+        if is_youtube:
+            ydl_opts['extractor_args'] = {'youtube': {'player_client': ['android', 'ios']}}
 
-    def iter_stream():
-        proc = subprocess.Popen(cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL)
-        try:
-            while True:
-                chunk = proc.stdout.read(65536) # 64KB chunks
-                if not chunk:
-                    break
-                yield chunk
-        finally:
-            proc.kill()
+    try:
+        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+            ydl.download([clean_url])
 
-    headers = {
-        "Content-Disposition": f'attachment; filename="{dl_filename}"',
-        "Content-Type": media_type,
-        "Cache-Control": "no-cache",
-    }
+        # Find the downloaded file
+        downloaded_file = None
+        for f in os.listdir(TEMP_DIR):
+            if f.startswith(file_id):
+                downloaded_file = os.path.join(TEMP_DIR, f)
+                break
 
-    return StreamingResponse(iter_stream(), headers=headers, media_type=media_type)
+        if not downloaded_file or not os.path.exists(downloaded_file) or os.path.getsize(downloaded_file) == 0:
+            raise HTTPException(status_code=500, detail="Download engine could not generate file")
+
+        media_type = "audio/mpeg" if is_audio else "video/mp4"
+        dl_name = filename or os.path.basename(downloaded_file)
+        if not dl_name.endswith(f".{ext}"):
+            dl_name += f".{ext}"
+
+        # Clean up the file after it has been sent to client
+        background_tasks.add_task(cleanup_file, downloaded_file)
+
+        return FileResponse(
+            downloaded_file,
+            media_type=media_type,
+            filename=dl_name
+        )
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
