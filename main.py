@@ -46,7 +46,7 @@ def health_check():
     return {
         "status": "ok",
         "app": "SnapSave Downloader Engine",
-        "version": "1.1.0",
+        "version": "1.2.0",
         "yt_dlp_version": yt_dlp.version.__version__
     }
 
@@ -84,18 +84,19 @@ def extract_media(req: ExtractRequest, request: Request):
         except Exception:
             pass
 
-    # 2. Extract with yt-dlp (android client for YouTube bypass)
+    # 2. Extract with yt-dlp (android client alone bypasses YouTube player response blocks)
     is_youtube = ("youtube.com" in url.lower()) or ("youtu.be" in url.lower())
     info = None
 
     if is_youtube:
-        clients_to_try = [['android'], ['ios'], ['mweb'], ['tv_embedded']]
+        clients_to_try = [['android'], ['mweb'], ['tv_embedded']]
         for client in clients_to_try:
             try:
                 ydl_opts = {
                     'quiet': True,
                     'no_warnings': True,
                     'extract_flat': False,
+                    'format': '18/best',
                     'extractor_args': {'youtube': {'player_client': client}}
                 }
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
@@ -204,16 +205,16 @@ def download_media(
             'outtmpl': out_template,
         }
         if is_youtube:
-            ydl_opts['extractor_args'] = {'youtube': {'player_client': ['android', 'ios']}}
+            ydl_opts['extractor_args'] = {'youtube': {'player_client': ['android']}}
     else:
         ydl_opts = {
             'quiet': True,
             'no_warnings': True,
-            'format': '18/bestvideo[ext=mp4]+bestaudio[ext=m4a]/best[ext=mp4]/best',
+            'format': '18/best[ext=mp4]/best',
             'outtmpl': out_template,
         }
         if is_youtube:
-            ydl_opts['extractor_args'] = {'youtube': {'player_client': ['android', 'ios']}}
+            ydl_opts['extractor_args'] = {'youtube': {'player_client': ['android']}}
 
     try:
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
