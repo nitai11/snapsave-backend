@@ -2,6 +2,7 @@ import os
 import re
 import urllib.parse
 import subprocess
+import requests
 from fastapi import FastAPI, HTTPException, Query, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse, StreamingResponse
@@ -43,13 +44,40 @@ def extract_media(req: ExtractRequest, request: Request):
 
     base_url = str(request.base_url).rstrip('/')
 
+    # Fast-path for TikTok to avoid IP rate-limits
+    if "tiktok.com" in url.lower():
+        try:
+            tik_res = requests.get(f"https://www.tikwm.com/api/?url={urllib.parse.quote(url)}", timeout=10)
+            if tik_res.ok:
+                tdata = tik_res.json()
+                if tdata.get("code") == 0 and "data" in tdata:
+                    d = tdata["data"]
+                    vurl = d.get("play") or d.get("hdplay")
+                    aurl = d.get("music") or vurl
+                    title = d.get("title") or "TikTok Media"
+                    clean_name = sanitize_filename(title, "mp3" if req.downloadMode == "audio" else "mp4")
+                    return {
+                        "status": "tunnel",
+                        "url": aurl if req.downloadMode == "audio" else vurl,
+                        "videoUrl": vurl,
+                        "audioUrl": aurl,
+                        "title": title,
+                        "author": d.get("author", {}).get("nickname", "TikTok"),
+                        "thumbnail": d.get("cover", ""),
+                        "duration": f"{d.get('duration', 0) // 60}:{d.get('duration', 0) % 60:02d}",
+                        "filename": clean_name,
+                    }
+        except Exception:
+            pass
+
+    # Use tv_embedded & android player_client for YouTube to bypass bot-checks and login blocks
     ydl_opts = {
         'quiet': True,
         'no_warnings': True,
         'extract_flat': False,
         'extractor_args': {
             'youtube': {
-                'player_client': ['android', 'web', 'ios'],
+                'player_client': ['tv_embedded', 'android', 'ios'],
             }
         }
     }
@@ -111,24 +139,23 @@ def download_stream(
     is_audio = (mode == "audio")
     dl_filename = filename or ("audio.mp3" if is_audio else "video.mp4")
 
-    # Command line args for yt-dlp to stream directly to stdout
+    # Command line args for yt-dlp to stream directly to stdout using tv_embedded client
     if is_audio:
         cmd = [
             "yt-dlp",
             "-q", "--no-warnings",
-            "--extractor-args", "youtube:player_client=android,web,ios",
+            "--extractor-args", "youtube:player_client=tv_embedded,android",
             "-x", "--audio-format", "mp3",
             "-o", "-",
             clean_url
         ]
         media_type = "audio/mpeg"
     else:
-        # Best video with audio under the requested quality
         format_spec = f"bestvideo[height<={quality}]+bestaudio/best[height<={quality}]/best"
         cmd = [
             "yt-dlp",
             "-q", "--no-warnings",
-            "--extractor-args", "youtube:player_client=android,web,ios",
+            "--extractor-args", "youtube:player_client=tv_embedded,android",
             "-f", format_spec,
             "--merge-output-format", "mp4",
             "-o", "-",
