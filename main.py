@@ -161,7 +161,7 @@ def health_check():
     return {
         "status": "ok",
         "app": "SnapSave Downloader Engine",
-        "version": "1.6.0",
+        "version": "2.0.0",
         "yt_dlp_version": yt_dlp.version.__version__,
         "ffmpeg": bool(FFMPEG_PATH),
         "cookies_loaded": has_cookies,
@@ -372,15 +372,15 @@ def run_download_task(task_id: str, clean_url: str, mode: str, quality: str, req
             # Format sorting: Prioritize highest resolution, highest fps, crisp H.264 (AVC) or VP9 codec, and highest bitrate!
             ydl_opts['format_sort'] = ['res', 'fps', 'codec:h264:vp9', 'size', 'br']
             if quality == '360':
-                ydl_opts['format'] = 'bestvideo[height<=360]+bestaudio/best[height<=360]/best'
+                ydl_opts['format'] = 'b[height<=360]/best[height<=360]/bv*[height<=360]+ba/best'
             elif quality == '480':
-                ydl_opts['format'] = 'bestvideo[height<=480]+bestaudio/best[height<=480]/best'
+                ydl_opts['format'] = 'b[height<=480]/best[height<=480]/bv*[height<=480]+ba/best'
             elif quality == '720':
-                ydl_opts['format'] = 'bestvideo[height<=720]+bestaudio/best[height<=720]/best'
+                ydl_opts['format'] = 'b[height<=720]/best[height<=720]/bv*[height<=720]+ba/best'
             elif quality == '1080':
-                ydl_opts['format'] = 'bestvideo[height<=1080]+bestaudio/best[height<=1080]/best'
+                ydl_opts['format'] = 'b[height<=1080]/best[height<=1080]/bv*[height<=1080]+ba/best'
             else:
-                ydl_opts['format'] = 'bestvideo+bestaudio/best'
+                ydl_opts['format'] = 'b/best/bv*+ba'
 
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([clean_url])
@@ -566,15 +566,15 @@ def download_media(
                 ydl_opts['merge_output_format'] = 'mp4'
                 ydl_opts['format_sort'] = ['res', 'fps', 'codec:h264:vp9', 'size', 'br']
                 if quality == '360':
-                    ydl_opts['format'] = 'bestvideo[height<=360]+bestaudio/best[height<=360]/best'
+                    ydl_opts['format'] = 'b[height<=360]/best[height<=360]/bv*[height<=360]+ba/best'
                 elif quality == '480':
-                    ydl_opts['format'] = 'bestvideo[height<=480]+bestaudio/best[height<=480]/best'
+                    ydl_opts['format'] = 'b[height<=480]/best[height<=480]/bv*[height<=480]+ba/best'
                 elif quality == '720':
-                    ydl_opts['format'] = 'bestvideo[height<=720]+bestaudio/best[height<=720]/best'
+                    ydl_opts['format'] = 'b[height<=720]/best[height<=720]/bv*[height<=720]+ba/best'
                 elif quality == '1080':
-                    ydl_opts['format'] = 'bestvideo[height<=1080]+bestaudio/best[height<=1080]/best'
+                    ydl_opts['format'] = 'b[height<=1080]/best[height<=1080]/bv*[height<=1080]+ba/best'
                 else:
-                    ydl_opts['format'] = 'bestvideo+bestaudio/best'
+                    ydl_opts['format'] = 'b/best/bv*+ba'
 
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 ydl.download([clean_url])
