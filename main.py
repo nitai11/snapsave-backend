@@ -7,7 +7,7 @@ import urllib.parse
 import requests
 from fastapi import FastAPI, HTTPException, Query, Request, BackgroundTasks
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
 from pydantic import BaseModel
 import yt_dlp
 
@@ -46,12 +46,19 @@ def get_base_ydl_opts(custom_opts=None):
         'no_warnings': True,
         'noplaylist': True,
         'socket_timeout': 30,
+        'extractor_args': {
+            'youtube': {
+                'player_client': ['ios', 'android']
+            }
+        }
     }
+    node_bin = shutil.which("node")
+    deno_bin = shutil.which("deno")
     js_runtimes = {}
-    if shutil.which("node"):
-        js_runtimes['node'] = {}
-    if shutil.which("deno"):
-        js_runtimes['deno'] = {}
+    if node_bin:
+        js_runtimes['node'] = {'path': node_bin}
+    if deno_bin:
+        js_runtimes['deno'] = {'path': deno_bin}
     if js_runtimes:
         opts['js_runtimes'] = js_runtimes
         opts['remote_components'] = ['ejs:github']
@@ -190,7 +197,11 @@ def extract_media(req: ExtractRequest, request: Request):
     # 1. Fast-path for TikTok
     if "tiktok.com" in url.lower():
         try:
-            tik_res = requests.get(f"https://www.tikwm.com/api/?url={urllib.parse.quote(url)}", timeout=8)
+            tik_res = requests.get(
+                f"https://www.tikwm.com/api/?url={urllib.parse.quote(url)}",
+                headers={"User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36"},
+                timeout=10
+            )
             if tik_res.ok:
                 tdata = tik_res.json()
                 if tdata.get("code") == 0 and "data" in tdata:
@@ -316,7 +327,7 @@ def run_download_task(task_id: str, clean_url: str, mode: str, quality: str, req
             percent = round((downloaded / total) * 100, 1) if total > 0 else 40.0
             d_str = format_bytes(downloaded)
             t_str = format_bytes(total)
-            msg = f"Downloading: {d_str} / {t_str} ({percent}%)" if total > 0 else f"Downloading: {d_str}"
+            msg = f"Step 1/2: Processing & Merging ({percent}%)..." if total > 0 else f"Step 1/2: Processing stream: {d_str}"
             download_tasks[task_id].update({
                 'status': 'downloading',
                 'percent': percent,
@@ -332,7 +343,7 @@ def run_download_task(task_id: str, clean_url: str, mode: str, quality: str, req
                 'percent': 95.0,
                 'speed': '',
                 'eta': '',
-                'message': 'Packaging and finalizing file...'
+                'message': 'Step 1/2: Packaging final HD file with FFmpeg...'
             })
 
     try:
@@ -347,25 +358,29 @@ def run_download_task(task_id: str, clean_url: str, mode: str, quality: str, req
         if FFMPEG_PATH:
             ydl_opts['ffmpeg_location'] = FFMPEG_PATH
 
-
         if is_audio:
-            ydl_opts['format'] = '140/bestaudio/best'
+            ydl_opts['format'] = 'bestaudio/best'
+            ydl_opts['format_sort'] = ['abr', 'quality', 'size']
             if FFMPEG_PATH:
                 ydl_opts['postprocessors'] = [{
                     'key': 'FFmpegExtractAudio',
                     'preferredcodec': 'mp3',
-                    'preferredquality': '192',
+                    'preferredquality': '320',
                 }]
         else:
             ydl_opts['merge_output_format'] = 'mp4'
+            # Format sorting: Prioritize highest resolution, highest fps, crisp H.264 (AVC) or VP9 codec, and highest bitrate!
+            ydl_opts['format_sort'] = ['res', 'fps', 'codec:h264:vp9', 'size', 'br']
             if quality == '360':
-                ydl_opts['format'] = '134+140/18/best[height<=360]/best'
+                ydl_opts['format'] = 'bestvideo[height<=360]+bestaudio/best[height<=360]/best'
             elif quality == '480':
-                ydl_opts['format'] = '135+140/bestvideo[height<=480]+bestaudio/best[height<=480]/best'
+                ydl_opts['format'] = 'bestvideo[height<=480]+bestaudio/best[height<=480]/best'
             elif quality == '720':
-                ydl_opts['format'] = '136+140/bestvideo[height<=720]+bestaudio/best[height<=720]/best'
+                ydl_opts['format'] = 'bestvideo[height<=720]+bestaudio/best[height<=720]/best'
+            elif quality == '1080':
+                ydl_opts['format'] = 'bestvideo[height<=1080]+bestaudio/best[height<=1080]/best'
             else:
-                ydl_opts['format'] = '137+140/bestvideo[height<=1080]+bestaudio/bestvideo+bestaudio/best'
+                ydl_opts['format'] = 'bestvideo+bestaudio/best'
 
         with yt_dlp.YoutubeDL(ydl_opts) as ydl:
             ydl.download([clean_url])
@@ -392,7 +407,7 @@ def run_download_task(task_id: str, clean_url: str, mode: str, quality: str, req
             'filename': dl_name,
             'size': os.path.getsize(final_file),
             'ext': actual_ext,
-            'message': 'Ready for download'
+            'message': 'Step 2/2: Ready! Saving to your device...'
         })
     except Exception as e:
         err_msg = str(e)
@@ -472,13 +487,28 @@ def get_downloaded_file(
     filename = task.get("filename", "download.mp4")
     media_type = "audio/mpeg" if filename.endswith(".mp3") else "video/mp4"
 
+    file_size = os.path.getsize(filepath)
+
+    def file_streamer():
+        with open(filepath, "rb") as f:
+            while chunk := f.read(1024 * 1024):  # 1MB buffer for fast streaming
+                yield chunk
+
     # Schedule cleanup after download completes
     background_tasks.add_task(cleanup_file, filepath)
 
-    return FileResponse(
-        filepath,
+    safe_name = urllib.parse.quote(filename)
+    headers = {
+        "Content-Disposition": f"attachment; filename=\"{filename}\"; filename*=UTF-8''{safe_name}",
+        "Content-Length": str(file_size),
+        "Accept-Ranges": "bytes",
+        "Cache-Control": "public, max-age=3600",
+    }
+
+    return StreamingResponse(
+        file_streamer(),
         media_type=media_type,
-        filename=filename
+        headers=headers
     )
 
 @app.get("/api/download")
@@ -498,7 +528,12 @@ def download_media(
 
     is_youtube = ("youtube.com" in clean_url.lower()) or ("youtu.be" in clean_url.lower())
 
-    client_configs = [None]
+    client_configs = [
+        ['ios', 'android'],
+        ['android'],
+        ['ios'],
+        None
+    ]
 
     last_error = None
     downloaded_file = None
@@ -511,29 +546,35 @@ def download_media(
                 'http_chunk_size': 10485760,
                 'buffersize': 1048576,
             })
+            if is_youtube and client_list:
+                ydl_opts['extractor_args'] = {'youtube': {'player_client': client_list}}
 
             if FFMPEG_PATH:
                 ydl_opts['ffmpeg_location'] = FFMPEG_PATH
 
 
             if is_audio:
-                ydl_opts['format'] = '140/bestaudio/best'
+                ydl_opts['format'] = 'bestaudio/best'
+                ydl_opts['format_sort'] = ['abr', 'quality', 'size']
                 if FFMPEG_PATH:
                     ydl_opts['postprocessors'] = [{
                         'key': 'FFmpegExtractAudio',
                         'preferredcodec': 'mp3',
-                        'preferredquality': '192',
+                        'preferredquality': '320',
                     }]
             else:
                 ydl_opts['merge_output_format'] = 'mp4'
+                ydl_opts['format_sort'] = ['res', 'fps', 'codec:h264:vp9', 'size', 'br']
                 if quality == '360':
-                    ydl_opts['format'] = '134+140/18/best[height<=360]/best'
+                    ydl_opts['format'] = 'bestvideo[height<=360]+bestaudio/best[height<=360]/best'
                 elif quality == '480':
-                    ydl_opts['format'] = '135+140/bestvideo[height<=480]+bestaudio/best[height<=480]/best'
+                    ydl_opts['format'] = 'bestvideo[height<=480]+bestaudio/best[height<=480]/best'
                 elif quality == '720':
-                    ydl_opts['format'] = '136+140/bestvideo[height<=720]+bestaudio/best[height<=720]/best'
+                    ydl_opts['format'] = 'bestvideo[height<=720]+bestaudio/best[height<=720]/best'
+                elif quality == '1080':
+                    ydl_opts['format'] = 'bestvideo[height<=1080]+bestaudio/best[height<=1080]/best'
                 else:
-                    ydl_opts['format'] = '137+140/bestvideo[height<=1080]+bestaudio/bestvideo+bestaudio/best'
+                    ydl_opts['format'] = 'bestvideo+bestaudio/best'
 
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 ydl.download([clean_url])
