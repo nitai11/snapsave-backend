@@ -224,16 +224,75 @@ def extract_media(req: ExtractRequest, request: Request):
         except Exception:
             pass
 
-    # 2. Fast-path for YouTube using official oEmbed (bypasses all bot challenges & timeouts)
+    # 2. Fast-path for YouTube via RapidAPI (24/7 Cloud Bypassing Bot Detection)
     is_youtube = ("youtube.com" in url.lower()) or ("youtu.be" in url.lower())
     if is_youtube:
         yt_m = re.search(r'(?:youtu\.be\/|youtube\.com\/(?:watch\?v=|shorts\/|embed\/))([a-zA-Z0-9_-]{11})', url)
         yt_id = yt_m.group(1) if yt_m else None
         
+        if yt_id:
+            try:
+                rapid_headers = {
+                    "x-rapidapi-host": "youtube-media-downloader.p.rapidapi.com",
+                    "x-rapidapi-key": "efb003e090msh83601f30812adc8p1a24a4jsn0b621b58c32a",
+                    "User-Agent": "Mozilla/5.0"
+                }
+                r = requests.get(f"https://youtube-media-downloader.p.rapidapi.com/v2/video/details?videoId={yt_id}", headers=rapid_headers, timeout=12)
+                if r.ok:
+                    ydata = r.json()
+                    title = ydata.get("title", "YouTube Video")
+                    channel_info = ydata.get("channel", {})
+                    author = channel_info.get("name", "YouTube Creator") if isinstance(channel_info, dict) else "YouTube Creator"
+                    duration_sec = ydata.get("lengthSeconds", 0)
+                    duration_str = f"{int(duration_sec) // 60}:{int(duration_sec) % 60:02d}" if duration_sec else ""
+                    thumbs = ydata.get("thumbnails", [])
+                    thumbnail = thumbs[-1].get("url") if thumbs and isinstance(thumbs[-1], dict) else f"https://i.ytimg.com/vi/{yt_id}/hqdefault.jpg"
+                    
+                    audio_items = ydata.get("audios", {}).get("items", [])
+                    audio_url = audio_items[0].get("url", "") if audio_items else ""
+                    
+                    video_items = ydata.get("videos", {}).get("items", [])
+                    selected_v = None
+                    req_q = str(req.videoQuality)
+                    for v in video_items:
+                        if req_q in str(v.get("quality", "")) and v.get("url"):
+                            selected_v = v
+                            break
+                    if not selected_v:
+                        for v in video_items:
+                            if v.get("hasAudio") and v.get("url"):
+                                selected_v = v
+                                break
+                    if not selected_v and video_items:
+                        selected_v = video_items[0]
+                    
+                    video_url = selected_v.get("url", "") if selected_v else ""
+                    v_ext = selected_v.get("extension", "mp4") if selected_v else "mp4"
+                    
+                    clean_name = sanitize_filename(title, "mp3" if req.downloadMode == "audio" else v_ext)
+                    active_stream = audio_url if req.downloadMode == "audio" and audio_url else (video_url or audio_url)
+                    
+                    return {
+                        "status": "tunnel",
+                        "url": active_stream,
+                        "videoUrl": video_url or active_stream,
+                        "audioUrl": audio_url,
+                        "title": title,
+                        "author": author,
+                        "thumbnail": thumbnail,
+                        "duration": duration_str,
+                        "filename": clean_name,
+                        "audioFilename": sanitize_filename(title, "mp3"),
+                        "isYouTube": True,
+                        "ytVideoId": yt_id,
+                    }
+            except Exception:
+                pass
+
+        # oEmbed fallback
         title = "YouTube Video"
         author = "YouTube"
         thumbnail = f"https://i.ytimg.com/vi/{yt_id}/hqdefault.jpg" if yt_id else ""
-        
         if yt_id:
             try:
                 oe = requests.get(f"https://www.youtube.com/oembed?url=https://www.youtube.com/watch?v={yt_id}&format=json", timeout=5).json()
@@ -345,6 +404,73 @@ def run_download_task(task_id: str, clean_url: str, mode: str, quality: str, req
                 'eta': '',
                 'message': 'Step 1/2: Packaging final HD file with FFmpeg...'
             })
+
+    # RapidAPI Fast-Stream for YouTube (Bypasses bot detection)
+    if is_youtube:
+        yt_m = re.search(r'(?:youtu\.be\/|youtube\.com\/(?:watch\?v=|shorts\/|embed\/))([a-zA-Z0-9_-]{11})', clean_url)
+        yt_id = yt_m.group(1) if yt_m else None
+        if yt_id:
+            try:
+                rapid_headers = {
+                    "x-rapidapi-host": "youtube-media-downloader.p.rapidapi.com",
+                    "x-rapidapi-key": "efb003e090msh83601f30812adc8p1a24a4jsn0b621b58c32a",
+                }
+                r = requests.get(f"https://youtube-media-downloader.p.rapidapi.com/v2/video/details?videoId={yt_id}", headers=rapid_headers, timeout=15)
+                if r.ok:
+                    ydata = r.json()
+                    target_stream_url = ""
+                    ext = "mp3" if is_audio else "mp4"
+                    if is_audio:
+                        audios = ydata.get("audios", {}).get("items", [])
+                        if audios:
+                            target_stream_url = audios[0].get("url", "")
+                    else:
+                        videos = ydata.get("videos", {}).get("items", [])
+                        for v in videos:
+                            if str(quality) in str(v.get("quality", "")) and v.get("url"):
+                                target_stream_url = v.get("url", "")
+                                ext = v.get("extension", "mp4")
+                                break
+                        if not target_stream_url:
+                            for v in videos:
+                                if v.get("hasAudio") and v.get("url"):
+                                    target_stream_url = v.get("url", "")
+                                    ext = v.get("extension", "mp4")
+                                    break
+                        if not target_stream_url and videos:
+                            target_stream_url = videos[0].get("url", "")
+                            ext = videos[0].get("extension", "mp4")
+
+                    if target_stream_url:
+                        out_file = os.path.join(TEMP_DIR, f"{file_id}.{ext}")
+                        with requests.get(target_stream_url, stream=True, timeout=60) as s_resp:
+                            s_resp.raise_for_status()
+                            total_bytes = int(s_resp.headers.get('content-length', 0))
+                            dl_bytes = 0
+                            with open(out_file, 'wb') as f_out:
+                                for chunk in s_resp.iter_content(chunk_size=131072):
+                                    if chunk:
+                                        f_out.write(chunk)
+                                        dl_bytes += len(chunk)
+                                        pct = round((dl_bytes / total_bytes) * 100, 1) if total_bytes > 0 else 50.0
+                                        download_tasks[task_id].update({
+                                            'status': 'downloading',
+                                            'percent': pct,
+                                            'downloaded': dl_bytes,
+                                            'total': total_bytes,
+                                            'message': f"Step 1/2: High-speed cloud streaming ({pct}%)..."
+                                        })
+                        title_clean = sanitize_filename(ydata.get("title", "youtube_video"), ext)
+                        download_tasks[task_id].update({
+                            'status': 'ready',
+                            'percent': 100.0,
+                            'filepath': out_file,
+                            'filename': filename or title_clean,
+                            'message': 'Step 2/2: Ready for download!'
+                        })
+                        return
+            except Exception:
+                pass
 
     try:
         ydl_opts = get_base_ydl_opts({
